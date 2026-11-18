@@ -41,10 +41,10 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button, select { cursor: pointer; }
-button, input, select { min-height: 44px; }
-button:focus-visible, input:focus-visible, select:focus-visible {
+button, input, select, textarea { min-height: 44px; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
   outline: 3px solid rgba(34, 211, 238, 0.45);
   outline-offset: 2px;
 }
@@ -134,7 +134,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .settings-form p { grid-column: 1 / -1; margin: 0; }
 .settings-form button { justify-self: start; }
 
-input, select {
+input, select, textarea {
   width: 100%;
   padding: 0.7rem 0.8rem;
   border: 1px solid var(--line-strong);
@@ -143,10 +143,11 @@ input, select {
   background: var(--page-glow);
   transition: border-color 160ms ease, box-shadow 160ms ease;
 }
+textarea { min-height: 150px; resize: vertical; }
 
-input::placeholder { color: var(--muted); }
-input:hover, select:hover { border-color: rgba(34, 211, 238, 0.45); }
-input:focus, select:focus {
+input::placeholder, textarea::placeholder { color: var(--muted); }
+input:hover, select:hover, textarea:hover { border-color: rgba(34, 211, 238, 0.45); }
+input:focus, select:focus, textarea:focus {
   border-color: var(--cyan-bright);
   box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12);
   outline: none;
@@ -216,8 +217,13 @@ tbody tr:last-child td { border-bottom: 0; }
 .team-player-card { margin-bottom: 0; }
 .team-player-card h3 { margin: 0; }
 .team-player-card .team-capacity { margin: 0; color: var(--muted); font-size: 0.84rem; font-weight: 650; }
+.player-roster-help { margin: -0.45rem 0 0.9rem; font-size: 0.84rem; }
 .team-capacity-progress { width: 100%; height: 0.75rem; accent-color: var(--cyan); }
 .team-player-form { display: grid; grid-template-columns: 1fr; margin-top: 0.25rem; }
+.bulk-player-form { display: grid; gap: 0.55rem; max-width: 720px; }
+.bulk-player-form label { color: var(--muted); font-size: 0.82rem; font-weight: 700; }
+.bulk-player-form textarea { min-height: 180px; }
+.bulk-player-form button { justify-self: start; }
 .team-directory-card { display: flex; flex-direction: column; gap: 1rem; }
 .team-identity { display: flex; align-items: center; gap: 0.8rem; }
 .team-identity .eyebrow { margin-bottom: 0.25rem; }

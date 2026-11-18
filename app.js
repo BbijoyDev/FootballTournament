@@ -24,6 +24,7 @@
     ["settings", "Settings"],
     ["access", "Manage Access"],
   ];
+  const maxBulkPlayersPerSubmission = 400;
   const tabIcons = {
     dashboard: "⌂",
     schedule: "▦",
@@ -325,7 +326,7 @@
     const initialCounts = countsExist ? null : buildTeamPlayerCounts();
     teamPlayerCountsInitializingId = tournamentId;
     try {
-      await db.runTransaction(async transaction => {
+      const updatedCount = await db.runTransaction(async transaction => {
         const snapshot = await transaction.get(tournament);
         if (!snapshot.exists) throw new Error("The tournament no longer exists.");
         const data = snapshot.data();
@@ -815,15 +816,31 @@
               ${!teamPlayerCountsReady ? `<p class="muted">Preparing team roster counts...</p>` : ""}
             </section>`;
         }).join("") : `<div class="card"><p class="muted">Add a team first to start registering players.</p></div>`}</div>
-        <div class="card"><h2>Player roster</h2>${players.length ? tableHtml(
+        <div class="card">
+          <h2>Add multiple players to a team</h2>
+          <p class="muted">Paste one player name per line. Blank lines are ignored, current players are kept, and the team’s player limit still applies.</p>
+          <form id="bulkPlayerForm" class="bulk-player-form">
+            <label for="bulkPlayerTeam">Team</label>
+            <select id="bulkPlayerTeam" ${teams.length ? "" : "disabled"}>
+              ${teams.map(team => `<option value="${escapeHtml(team.id)}">${escapeHtml(team.name)}</option>`).join("")}
+            </select>
+            <label for="bulkPlayerNames">Player names (one per line)</label>
+            <textarea id="bulkPlayerNames" rows="7" placeholder="Enter one name per line" ${teams.length ? "" : "disabled"}></textarea>
+            <p id="bulkPlayerHint" class="muted" aria-live="polite"></p>
+            <button type="submit" ${!teamPlayerCountsReady || !teams.length ? "disabled" : ""}>Add players</button>
+          </form>
+        </div>
+        <div class="card"><h2>Player roster</h2>
+        <p class="player-roster-help muted">Edit a name or team, then save that player’s row. Delete removes only that player.</p>
+        ${players.length ? tableHtml(
           ["Name", "Team", "Actions"],
           players.map(player => [
-            `<input class="edit-player-name" data-player="${player.id}" value="${escapeHtml(player.name)}" />`,
-            `<select class="edit-player-team" data-player="${player.id}">
+            `<input class="edit-player-name" aria-label="Name for ${escapeHtml(player.name)}" value="${escapeHtml(player.name)}" />`,
+            `<select class="edit-player-team" aria-label="Team for ${escapeHtml(player.name)}">
               ${teams.map(team => `<option value="${team.id}" ${team.id === player.teamId ? "selected" : ""}>${escapeHtml(team.name)}</option>`).join("")}
             </select>`,
-            `<button type="button" data-player-action="save" data-player="${player.id}">Save</button>
-             <button type="button" class="danger-button" data-player-action="delete" data-player="${player.id}">Delete</button>`
+            `<button type="button" data-player-action="save" data-player="${escapeHtml(player.id)}">Save changes</button>
+             <button type="button" class="danger-button" data-player-action="delete" data-player="${escapeHtml(player.id)}">Delete</button>`
           ])
         ) : `<p class="muted">No players yet.</p>`}</div>`;
       bindPlayerAdmin(content, teamPlayerCountsReady, displayedCounts, maxPlayersPerTeam);
@@ -877,15 +894,41 @@
         </div>
         <div class="card">
           <h2>Reset tournament</h2>
-          <p class="muted">This deletes all teams, players and matches.</p>
+          <p class="muted">This deletes all teams, players and matches, but keeps the tournament and its settings.</p>
           <button id="resetTournament" class="danger-button" type="button">Reset Tournament</button>
         </div>`;
+      content.insertAdjacentHTML("beforeend", `
+        <div class="card">
+          <h2>Delete tournament</h2>
+          <p class="muted">Permanently deletes this tournament, its teams, players, matches and scorekeeper access. This cannot be undone.</p>
+          <button id="deleteTournament" class="danger-button" type="button">Delete tournament permanently</button>
+        </div>`);
       document.getElementById("settingsForm").addEventListener("submit", event =>
         runAdminAction(() => saveTournamentName(event), "Tournament settings saved.")
       );
       document.getElementById("resetTournament").addEventListener("click", () =>
         runAdminAction(resetTournament)
       );
+      document.getElementById("deleteTournament").addEventListener("click", () => {
+        const tournamentId = activeTournamentId;
+        const tournamentName = activeTournament?.name;
+        if (!tournamentId || !tournamentName) {
+          showAdminMessage("Select a tournament before deleting it.");
+          return;
+        }
+        const typedName = prompt(
+          `This permanently deletes "${tournamentName}" and all its data. Type the tournament name to confirm.`
+        );
+        if (typedName === null) return;
+        if (typedName.trim() !== tournamentName) {
+          showAdminMessage("The tournament name did not match. Nothing was deleted.");
+          return;
+        }
+        runAdminAction(
+          () => deleteTournament(tournamentId, tournamentName),
+          "Tournament deleted."
+        );
+      });
     }
 
     if (adminTab === "access" && isOwner) {
@@ -1110,82 +1153,197 @@
         });
       });
     });
-    content.querySelectorAll("[data-player-action]").forEach(button => {
-      button.addEventListener("click", () => runAdminAction(async () => {
-        const id = button.dataset.player;
-        const player = tournamentRef().collection("players").doc(id);
-        if (button.dataset.playerAction === "save") {
-          const name = content.querySelector(`.edit-player-name[data-player="${id}"]`).value.trim();
-          const teamId = content.querySelector(`.edit-player-team[data-player="${id}"]`).value;
-          if (!name || !teamId) throw new Error("Player name and team are required.");
+    const bulkPlayerForm = content.querySelector("#bulkPlayerForm");
+    if (bulkPlayerForm) {
+      const bulkTeamSelect = bulkPlayerForm.querySelector("#bulkPlayerTeam");
+      const bulkNamesInput = bulkPlayerForm.querySelector("#bulkPlayerNames");
+      const bulkHint = bulkPlayerForm.querySelector("#bulkPlayerHint");
+      const bulkAddButton = bulkPlayerForm.querySelector("button[type='submit']");
+      const updateBulkHint = () => {
+        const teamId = bulkTeamSelect.value;
+        const count = Number.isSafeInteger(displayedCounts[teamId]) ? displayedCounts[teamId] : 0;
+        const remaining = maxPlayersPerTeam === null
+          ? null
+          : Math.max(0, maxPlayersPerTeam - count);
+        bulkHint.textContent = !countsReady
+          ? "Preparing team roster counts..."
+          : remaining === null
+            ? `No team cap set. Up to ${maxBulkPlayersPerSubmission} players per submission.`
+            : `${remaining} roster spot${remaining === 1 ? "" : "s"} available. Up to ${maxBulkPlayersPerSubmission} players per submission.`;
+        bulkAddButton.disabled = !countsReady || !teamId || remaining === 0;
+      };
+      bulkTeamSelect.addEventListener("change", updateBulkHint);
+      updateBulkHint();
+
+      bulkPlayerForm.addEventListener("submit", event => {
+        event.preventDefault();
+        const teamId = bulkTeamSelect.value;
+        const team = teams.find(item => item.id === teamId);
+        const names = bulkNamesInput.value.split(/\r?\n/).map(name => name.trim()).filter(Boolean);
+        if (!team) {
+          showAdminMessage("Select a team before adding players.");
+          return;
+        }
+        if (!names.length) {
+          showAdminMessage("Enter one or more player names, one per line.");
+          return;
+        }
+        if (names.length > maxBulkPlayersPerSubmission) {
+          showAdminMessage(`Add no more than ${maxBulkPlayersPerSubmission} players per submission.`);
+          return;
+        }
+        runAdminAction(async () => {
           const tournament = tournamentRef();
-          const team = tournament.collection("teams").doc(teamId);
-          await db.runTransaction(async transaction => {
-            const [tournamentSnapshot, playerSnapshot, teamSnapshot] = await Promise.all([
+          const teamRef = tournament.collection("teams").doc(teamId);
+          const newPlayers = names.map(name => ({
+            ref: tournament.collection("players").doc(),
+            name
+          }));
+          const updatedCount = await db.runTransaction(async transaction => {
+            const [tournamentSnapshot, teamSnapshot] = await Promise.all([
               transaction.get(tournament),
-              transaction.get(player),
-              transaction.get(team)
+              transaction.get(teamRef)
             ]);
             if (!tournamentSnapshot.exists) throw new Error("The tournament no longer exists.");
-            if (!playerSnapshot.exists) throw new Error("The player no longer exists.");
             if (!teamSnapshot.exists) throw new Error("The selected team no longer exists.");
             const tournamentData = tournamentSnapshot.data();
             const counts = tournamentData.teamPlayerCounts;
             if (!hasTeamPlayerCounts(counts)) {
               throw new Error("Team player counts are still initializing. Try again shortly.");
             }
-            const previousTeamId = playerSnapshot.data().teamId;
-            if (previousTeamId !== teamId) {
-              const previousCount = counts[previousTeamId];
-              if (!Number.isSafeInteger(previousCount) || previousCount < 1) {
-                throw new Error("The current team count is inconsistent. Refresh and try again.");
-              }
-              const nextCount = counts[teamId] === undefined ? 0 : counts[teamId];
-              if (!Number.isSafeInteger(nextCount) || nextCount < 0) {
-                throw new Error("The selected team count is inconsistent. Refresh and try again.");
-              }
-              const limit = tournamentData.maxPlayersPerTeam;
-              if (limit !== null && limit !== undefined &&
-                  (!Number.isSafeInteger(limit) || limit < 0)) {
-                throw new Error("The per-team player limit is invalid. Review tournament settings.");
-              }
-              if (Number.isInteger(limit) && nextCount >= limit) {
-                throw new Error(`The selected team has reached its limit of ${limit} players.`);
-              }
-              const updatedCounts = {
-                ...counts,
-                [previousTeamId]: previousCount - 1,
-                [teamId]: nextCount + 1
-              };
-              transaction.update(tournament, { teamPlayerCounts: updatedCounts });
-            }
-            transaction.update(player, { name, teamId });
-          });
-        } else if (confirm("Delete this player?")) {
-          const tournament = tournamentRef();
-          await db.runTransaction(async transaction => {
-            const [tournamentSnapshot, playerSnapshot] = await Promise.all([
-              transaction.get(tournament),
-              transaction.get(player)
-            ]);
-            if (!playerSnapshot.exists) return;
-            if (!tournamentSnapshot.exists) throw new Error("The tournament no longer exists.");
-            const tournamentData = tournamentSnapshot.data();
-            const counts = tournamentData.teamPlayerCounts;
-            if (!hasTeamPlayerCounts(counts)) {
-              throw new Error("Team player counts are still initializing. Try again shortly.");
-            }
-            const teamId = playerSnapshot.data().teamId;
-            const count = counts[teamId];
-            if (!Number.isSafeInteger(count) || count < 1) {
+            const count = counts[teamId] === undefined ? 0 : counts[teamId];
+            if (!Number.isSafeInteger(count) || count < 0) {
               throw new Error("The team player count is inconsistent. Refresh and try again.");
             }
-            const updatedCounts = { ...counts, [teamId]: count - 1 };
-            transaction.delete(player);
-            transaction.update(tournament, { teamPlayerCounts: updatedCounts });
+            const limit = tournamentData.maxPlayersPerTeam;
+            if (limit !== null && limit !== undefined &&
+                (!Number.isSafeInteger(limit) || limit < 0)) {
+              throw new Error("The per-team player limit is invalid. Review tournament settings.");
+            }
+            if (Number.isInteger(limit) && count + names.length > limit) {
+              throw new Error(`This team has only ${Math.max(0, limit - count)} roster spots available; ${names.length} players were entered.`);
+            }
+            for (const newPlayer of newPlayers) {
+              transaction.set(newPlayer.ref, {
+                name: newPlayer.name,
+                teamId,
+                createdAt: firebase.firestore.FieldValue.serverTimestamp()
+              });
+            }
+            transaction.update(tournament, {
+              teamPlayerCounts: { ...counts, [teamId]: count + newPlayers.length }
+            });
+            return count + newPlayers.length;
           });
+          displayedCounts[teamId] = updatedCount;
+          bulkNamesInput.value = "";
+          updateBulkHint();
+        }, `Added ${names.length} player${names.length === 1 ? "" : "s"} to ${team.name}.`);
+      });
+    }
+    content.querySelectorAll("[data-player-action]").forEach(button => {
+      button.addEventListener("click", () => {
+        const row = button.closest("tr");
+        if (!row) {
+          showAdminMessage("Unable to locate this player's roster row. Refresh and try again.");
+          return;
         }
-      }));
+        const id = button.dataset.player;
+        const nameInput = row.querySelector(".edit-player-name");
+        const teamSelect = row.querySelector(".edit-player-team");
+        const action = button.dataset.playerAction;
+        if (action !== "save" && action !== "delete") {
+          showAdminMessage("Unknown player action. Refresh and try again.");
+          return;
+        }
+        const isSave = action === "save";
+        const name = nameInput?.value.trim();
+        const teamId = teamSelect?.value;
+        if (isSave && (!nameInput || !teamSelect)) {
+          showAdminMessage("Unable to read this player's changes. Refresh and try again.");
+          return;
+        }
+        if (isSave && (!name || !teamId)) {
+          showAdminMessage("Player name and team are required.");
+          return;
+        }
+        const savedPlayer = players.find(item => item.id === id);
+        if (!isSave && !confirm(`Delete ${savedPlayer?.name || "this player"}? This cannot be undone.`)) {
+          return;
+        }
+        runAdminAction(async () => {
+          if (!id) throw new Error("The selected player could not be identified.");
+          const player = tournamentRef().collection("players").doc(id);
+          if (isSave) {
+            const tournament = tournamentRef();
+            const team = tournament.collection("teams").doc(teamId);
+            await db.runTransaction(async transaction => {
+              const [tournamentSnapshot, playerSnapshot, teamSnapshot] = await Promise.all([
+                transaction.get(tournament),
+                transaction.get(player),
+                transaction.get(team)
+              ]);
+              if (!tournamentSnapshot.exists) throw new Error("The tournament no longer exists.");
+              if (!playerSnapshot.exists) throw new Error("The player no longer exists.");
+              if (!teamSnapshot.exists) throw new Error("The selected team no longer exists.");
+              const tournamentData = tournamentSnapshot.data();
+              const counts = tournamentData.teamPlayerCounts;
+              if (!hasTeamPlayerCounts(counts)) {
+                throw new Error("Team player counts are still initializing. Try again shortly.");
+              }
+              const previousTeamId = playerSnapshot.data().teamId;
+              if (previousTeamId !== teamId) {
+                const previousCount = counts[previousTeamId];
+                if (!Number.isSafeInteger(previousCount) || previousCount < 1) {
+                  throw new Error("The current team count is inconsistent. Refresh and try again.");
+                }
+                const nextCount = counts[teamId] === undefined ? 0 : counts[teamId];
+                if (!Number.isSafeInteger(nextCount) || nextCount < 0) {
+                  throw new Error("The selected team count is inconsistent. Refresh and try again.");
+                }
+                const limit = tournamentData.maxPlayersPerTeam;
+                if (limit !== null && limit !== undefined &&
+                    (!Number.isSafeInteger(limit) || limit < 0)) {
+                  throw new Error("The per-team player limit is invalid. Review tournament settings.");
+                }
+                if (Number.isInteger(limit) && nextCount >= limit) {
+                  throw new Error(`The selected team has reached its limit of ${limit} players.`);
+                }
+                const updatedCounts = {
+                  ...counts,
+                  [previousTeamId]: previousCount - 1,
+                  [teamId]: nextCount + 1
+                };
+                transaction.update(tournament, { teamPlayerCounts: updatedCounts });
+              }
+              transaction.update(player, { name, teamId });
+            });
+          } else {
+            const tournament = tournamentRef();
+            await db.runTransaction(async transaction => {
+              const [tournamentSnapshot, playerSnapshot] = await Promise.all([
+                transaction.get(tournament),
+                transaction.get(player)
+              ]);
+              if (!playerSnapshot.exists) return;
+              if (!tournamentSnapshot.exists) throw new Error("The tournament no longer exists.");
+              const tournamentData = tournamentSnapshot.data();
+              const counts = tournamentData.teamPlayerCounts;
+              if (!hasTeamPlayerCounts(counts)) {
+                throw new Error("Team player counts are still initializing. Try again shortly.");
+              }
+              const playerTeamId = playerSnapshot.data().teamId;
+              const count = counts[playerTeamId];
+              if (!Number.isSafeInteger(count) || count < 1) {
+                throw new Error("The team player count is inconsistent. Refresh and try again.");
+              }
+              const updatedCounts = { ...counts, [playerTeamId]: count - 1 };
+              transaction.delete(player);
+              transaction.update(tournament, { teamPlayerCounts: updatedCounts });
+            });
+          }
+        }, isSave ? `Updated ${name}.` : `Deleted ${savedPlayer?.name || "player"}.`);
+      });
     });
   }
 
@@ -1492,8 +1650,8 @@
     });
   }
 
-  async function deleteCollection(collectionName) {
-    const snapshot = await tournamentRef().collection(collectionName).get();
+  async function deleteCollection(tournament, collectionName) {
+    const snapshot = await tournament.collection(collectionName).get();
     let batch = db.batch();
     let count = 0;
     for (const doc of snapshot.docs) {
@@ -1510,11 +1668,30 @@
 
   async function resetTournament() {
     if (!confirm("Reset this tournament? This cannot be undone.")) return;
-    await deleteCollection("teams");
-    await deleteCollection("players");
-    await deleteCollection("matches");
-    await deleteCollection("scorekeepers");
-    await tournamentRef().update({ teamPlayerCounts: {} });
+    const tournament = tournamentRef();
+    await deleteCollection(tournament, "teams");
+    await deleteCollection(tournament, "players");
+    await deleteCollection(tournament, "matches");
+    await deleteCollection(tournament, "scorekeepers");
+    await tournament.update({ teamPlayerCounts: {} });
+  }
+
+  async function deleteTournament(tournamentId, expectedName) {
+    const tournament = db.collection("tournaments").doc(tournamentId);
+    const snapshot = await tournament.get();
+    if (!snapshot.exists) throw new Error("The tournament no longer exists.");
+    const tournamentData = snapshot.data();
+    if (!currentUser || tournamentData.ownerUid !== currentUser.uid) {
+      throw new Error("Only this tournament's Owner can delete it.");
+    }
+    if (tournamentData.name !== expectedName) {
+      throw new Error("The tournament name changed. Refresh and try again.");
+    }
+    await deleteCollection(tournament, "teams");
+    await deleteCollection(tournament, "players");
+    await deleteCollection(tournament, "matches");
+    await deleteCollection(tournament, "scorekeepers");
+    await tournament.delete();
   }
 
   function bindAppEvents() {

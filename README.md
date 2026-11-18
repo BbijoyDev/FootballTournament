@@ -8,6 +8,8 @@ A static, public football tournament manager built with HTML, CSS, vanilla JavaS
 - Real-time score updates through Firestore listeners
 - Administrator login
 - Tournament, team and player management
+- Bulk player entry for a selected team, preserving its existing roster
+- Owner-only permanent tournament deletion with a typed-name confirmation
 - Optional per-team player limit, configurable separately for each tournament
 - Team-specific player-entry cards with live roster capacity indicators
 - Permanent Owner role and temporary, time-bounded Scorekeeper permissions
@@ -145,6 +147,8 @@ tournaments/{tournamentId}
 The tournament document contains its name, immutable Owner UID, optional `maxPlayersPerTeam`, and maintained per-team `teamPlayerCounts`. Teams, players and matches are public-read subcollections. Scorekeeper access records are private and writable only by the Owner.
 
 The Owner can set an optional maximum number of players per team in **Admin mode > Settings**. The same limit applies to every team in that tournament; leave it blank for no cap. Existing rosters remain intact if a lower cap is set, but a team over the limit cannot add players or accept transfers until it is under the cap. Adding, moving, and removing players update per-team counts transactionally. Existing tournaments initialize counts from their player rosters when an Owner opens them. Older tournaments automatically copy a saved `maxPlayers` value into the per-team limit field if no per-team value exists. New tournament documents start with no limit and empty counts.
+
+In **Admin mode > Players**, the Owner can paste one player name per line to add multiple players to a selected team without replacing its existing roster. Blank lines are ignored, and each submission is limited to 400 names and checked against the team's remaining capacity. In **Admin mode > Settings**, the Owner can permanently delete a tournament and its teams, players, matches, and Scorekeeper records. Deletion requires typing the tournament name and cannot be undone.
 
 ## Local testing
 
