@@ -1,0 +1,121 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function tournamentPath(tournamentId) {
+      return /databases/$(database)/documents/tournaments/$(tournamentId);
+    }
+
+    function isOwner(tournamentId) {
+      return signedIn() &&
+        get(tournamentPath(tournamentId)).data.ownerUid == request.auth.uid;
+    }
+
+    function scorekeeperPath(tournamentId) {
+      return /databases/$(database)/documents/tournaments/$(tournamentId)/scorekeepers/$(request.auth.token.email);
+    }
+
+    function hasActiveScorekeeperGrant(tournamentId) {
+      return signedIn() &&
+        request.auth.token.email_verified == true &&
+        exists(scorekeeperPath(tournamentId)) &&
+        get(scorekeeperPath(tournamentId)).data.email == request.auth.token.email &&
+        get(scorekeeperPath(tournamentId)).data.startsAt <= request.time &&
+        get(scorekeeperPath(tournamentId)).data.expiresAt > request.time;
+    }
+
+    function mayManageMatch(tournamentId, matchId) {
+      return hasActiveScorekeeperGrant(tournamentId) &&
+        (get(scorekeeperPath(tournamentId)).data.matchId == null ||
+         get(scorekeeperPath(tournamentId)).data.matchId == matchId);
+    }
+
+    function mayCorrectCompletedMatches(tournamentId) {
+      return get(scorekeeperPath(tournamentId)).data.allowCompletedMatches == true;
+    }
+
+    function validScorekeeperMatchUpdate(tournamentId) {
+      return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['goals', 'teamAScore', 'teamBScore', 'status']) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['goals', 'teamAScore', 'teamBScore', 'status']) &&
+        request.resource.data.teamAScore is int &&
+        request.resource.data.teamAScore >= 0 &&
+        request.resource.data.teamBScore is int &&
+        request.resource.data.teamBScore >= 0 &&
+        request.resource.data.goals is list &&
+        (
+          (
+            resource.data.status == 'scheduled' &&
+            request.resource.data.status == 'live' &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          ) ||
+          (
+            resource.data.status == 'live' &&
+            request.resource.data.status in ['live', 'finished']
+          ) ||
+          (
+            resource.data.status == 'finished' &&
+            mayCorrectCompletedMatches(tournamentId) &&
+            request.resource.data.status in ['finished', 'live']
+          )
+        );
+    }
+
+    match /tournaments/{tournamentId} {
+      allow read: if true;
+      allow create: if signedIn() &&
+        request.resource.data.keys().hasAll([
+          'name', 'ownerUid', 'maxPlayersPerTeam', 'teamPlayerCounts'
+        ]) &&
+        request.resource.data.name is string &&
+        request.resource.data.ownerUid == request.auth.uid &&
+        (
+          request.resource.data.maxPlayersPerTeam == null ||
+          (
+            request.resource.data.maxPlayersPerTeam is int &&
+            request.resource.data.maxPlayersPerTeam >= 0
+          )
+        ) &&
+        request.resource.data.teamPlayerCounts is map &&
+        request.resource.data.keys().hasOnly([
+          'name', 'ownerUid', 'maxPlayersPerTeam', 'teamPlayerCounts',
+          'createdAt', 'updatedAt'
+        ]);
+      allow update: if isOwner(tournamentId) &&
+        request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isOwner(tournamentId);
+
+      match /teams/{teamId} {
+        allow read: if true;
+        allow write: if isOwner(tournamentId);
+      }
+
+      match /players/{playerId} {
+        allow read: if true;
+        allow write: if isOwner(tournamentId);
+      }
+
+      match /matches/{matchId} {
+        allow read: if true;
+        allow create, delete: if isOwner(tournamentId);
+        allow update: if isOwner(tournamentId) ||
+          (
+            mayManageMatch(tournamentId, matchId) &&
+            (resource.data.status != 'finished' || mayCorrectCompletedMatches(tournamentId)) &&
+            validScorekeeperMatchUpdate(tournamentId)
+          );
+      }
+
+      match /scorekeepers/{email} {
+        allow read: if isOwner(tournamentId) ||
+          (signedIn() && request.auth.token.email == email);
+        allow create, update, delete: if isOwner(tournamentId);
+      }
+    }
+  }
+}
