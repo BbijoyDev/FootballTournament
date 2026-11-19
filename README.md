@@ -15,6 +15,7 @@ A static, public football tournament manager built with HTML, CSS, vanilla JavaS
 - Permanent Owner role and temporary, time-bounded Scorekeeper permissions
 - Match-specific Scorekeeper permissions and immediate access revocation
 - Round-robin fixtures
+- Knockout seeding after all league fixtures are finished
 - Live matches, goal edits/removal and goal-scorer selection
 - Score finishing and reopening
 - Quarter-final, semi-final and final bracket progression
@@ -40,6 +41,7 @@ Your site URL will normally be:
 `https://USERNAME.github.io/football-tournament/`
 
 The app uses relative resources and reads the tournament ID from the `tournament` query parameter when present, so it does not require repository-specific absolute URLs.
+Use the tournament's actual Firestore document ID in shared links; an unknown ID is shown as not found rather than opening a different tournament.
 
 ## 3. Create the Firebase project
 

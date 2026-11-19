@@ -49,6 +49,7 @@
   let authorizationContext = null;
   let teamPlayerCountsInitializingId = null;
   let activeTournamentId = new URLSearchParams(location.search).get("tournament");
+  let missingTournamentId = null;
   let listenedTournamentId = null;
   let activeTournament = null;
   let teams = [];
@@ -58,6 +59,7 @@
   let publicTab = "dashboard";
   let adminTab = "teams";
   const publicUnsubscribes = [];
+  const matchActionsInProgress = new Set();
 
   function isConfigured() {
     const config = window.FIREBASE_CONFIG;
@@ -139,17 +141,21 @@
 
     db.collection("tournaments").orderBy("name").onSnapshot(snapshot => {
       const tournaments = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      if (!tournaments.length) {
-        renderTournamentSelector(tournaments);
-        listenToTournament(null);
-        return;
+      if (activeTournamentId && !tournaments.some(item => item.id === activeTournamentId)) {
+        if (snapshot.metadata.fromCache) {
+          renderTournamentSelector(tournaments);
+          listenToTournament(activeTournamentId);
+          return;
+        }
+        missingTournamentId = activeTournamentId;
+        activeTournamentId = null;
       }
-
-      if (!activeTournamentId || !tournaments.some(item => item.id === activeTournamentId)) {
-        activeTournamentId = tournaments[0].id;
+      if (!activeTournamentId && !missingTournamentId) {
+        activeTournamentId = tournaments[0]?.id || null;
       }
       renderTournamentSelector(tournaments);
       listenToTournament(activeTournamentId);
+      if (!activeTournamentId) renderPublic();
     }, error => showSetupError(error));
 
     auth.onAuthStateChanged(user => {
@@ -183,6 +189,7 @@
     publicUnsubscribes.length = 0;
     listenedTournamentId = id;
     activeTournamentId = id || null;
+    if (id) missingTournamentId = null;
     activeTournament = null;
     teams = [];
     players = [];
@@ -326,7 +333,7 @@
     const initialCounts = countsExist ? null : buildTeamPlayerCounts();
     teamPlayerCountsInitializingId = tournamentId;
     try {
-      const updatedCount = await db.runTransaction(async transaction => {
+      await db.runTransaction(async transaction => {
         const snapshot = await transaction.get(tournament);
         if (!snapshot.exists) throw new Error("The tournament no longer exists.");
         const data = snapshot.data();
@@ -426,6 +433,12 @@
     );
   }
 
+  function isLeagueStageComplete() {
+    const leagueMatches = matches.filter(match => match.stage === "League");
+    return leagueMatches.length > 0 &&
+      leagueMatches.every(match => match.status === "finished");
+  }
+
   function calculateTopScorers() {
     const totals = new Map();
     matches.forEach(match => (match.goals || []).forEach(goal => {
@@ -486,7 +499,11 @@
           <div><p class="eyebrow">UP NEXT</p><h2>Upcoming fixtures</h2></div>
           <button type="button" class="text-button" data-open-tab="schedule">All fixtures <span aria-hidden="true">→</span></button>
         </div>
-        ${renderMatchGrid(upcomingMatches, false)}
+        ${renderMatchGrid(
+          upcomingMatches,
+          false,
+          sortedMatches.length ? "No upcoming matches." : "No matches yet."
+        )}
       </section>
       <div class="dashboard-columns">
         <section class="card dashboard-section">
@@ -529,7 +546,9 @@
     });
     const content = document.getElementById("publicContent");
     if (!activeTournament) {
-      content.innerHTML = `<div class="card"><h2>No tournaments</h2><p class="muted">An administrator needs to create and publish a tournament.</p></div>`;
+      content.innerHTML = missingTournamentId
+        ? `<div class="card"><h2>Tournament not found</h2><p class="muted">The tournament link “${escapeHtml(missingTournamentId)}” does not match an available tournament.</p></div>`
+        : `<div class="card"><h2>No tournaments</h2><p class="muted">An administrator needs to create and publish a tournament.</p></div>`;
       return;
     }
 
@@ -645,13 +664,15 @@
     }).join("")}</tbody></table></div>`;
   }
 
-  function renderMatchGrid(matchList, admin) {
-    if (!matchList.length) return `<p class="muted">No matches yet.</p>`;
+  function renderMatchGrid(matchList, admin, emptyMessage = "No matches yet.") {
+    if (!matchList.length) return `<p class="muted">${escapeHtml(emptyMessage)}</p>`;
     return `<div class="grid match-grid">${matchList.map(match => {
       const goals = match.goals || [];
       const status = match.status || "scheduled";
       const statusLabel = status === "live" ? "LIVE" : status === "finished" ? "FULL TIME" : "UPCOMING";
       const manageThisMatch = admin && canManageMatch(match);
+      const matchBusy = matchActionsInProgress.has(match.id);
+      const disabled = matchBusy ? " disabled" : "";
       const correctFinished = status !== "finished" || isOwner || scorekeeperGrant?.allowCompletedMatches === true;
       const isFinished = status === "finished";
       const winnerId = isFinished && match.teamAScore !== match.teamBScore
@@ -664,46 +685,46 @@
         `<div class="goal-item">
           <span class="goal-scorer"><span class="goal-ball" aria-hidden="true">⚽</span>${escapeHtml(goal.playerName || playerName(goal.playerId))}</span>${
           manageThisMatch && correctFinished ? `
-            <select class="edit-goal-team" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}" aria-label="Goal team">
+            <select class="edit-goal-team" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}" aria-label="Goal team"${disabled}>
               ${[match.teamAId, match.teamBId].filter(Boolean).map(id =>
                 `<option value="${escapeHtml(id)}" ${id === goal.teamId ? "selected" : ""}>${escapeHtml(teamName(id))}</option>`
               ).join("")}
             </select>
-            <select class="edit-goal-player" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}" aria-label="Goal scorer">
+            <select class="edit-goal-player" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}" aria-label="Goal scorer"${disabled}>
               ${players.filter(player => player.teamId === goal.teamId).map(player =>
                 `<option value="${escapeHtml(player.id)}" ${player.id === goal.playerId ? "selected" : ""}>${escapeHtml(player.name)}</option>`
               ).join("")}
             </select>
-            <button type="button" class="secondary-button save-goal" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}">Save</button>
-            <button type="button" class="danger-button remove-goal" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}">Remove</button>
+            <button type="button" class="secondary-button save-goal" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}"${disabled}>Save</button>
+            <button type="button" class="danger-button remove-goal" data-match="${escapeHtml(match.id)}" data-goal="${escapeHtml(goal.id)}"${disabled}>Remove</button>
           ` : ""
         }</div>`
       ).join("")}</div>` : "";
       const canAddGoal = manageThisMatch && correctFinished && ["live", "finished"].includes(status);
       const actions = manageThisMatch ? `
         <div class="match-admin-controls">
-          ${status === "scheduled" ? `<button class="match-control-primary" type="button" data-action="start" data-match="${escapeHtml(match.id)}">Start match</button>` : ""}
+          ${status === "scheduled" ? `<button class="match-control-primary" type="button" data-action="start" data-match="${escapeHtml(match.id)}"${disabled}>Start match</button>` : ""}
           ${canAddGoal ? `
             <div class="goal-entry">
               <label>Scoring team
-                <select class="goal-team" data-match="${escapeHtml(match.id)}" aria-label="Scoring team">
+                <select class="goal-team" data-match="${escapeHtml(match.id)}" aria-label="Scoring team"${disabled}>
                   ${[match.teamAId, match.teamBId].filter(Boolean).map(id =>
                     `<option value="${escapeHtml(id)}">${escapeHtml(teamName(id))}</option>`
                   ).join("")}
                 </select>
               </label>
               <label>Goal scorer
-                <select class="goal-player" data-match="${escapeHtml(match.id)}" aria-label="Goal scorer">
-                  ${getPlayersForMatch(match, match.teamAId).map(player =>
+                <select class="goal-player" data-match="${escapeHtml(match.id)}" aria-label="Goal scorer"${disabled}>
+                  ${getPlayersForMatch(match.teamAId).map(player =>
                     `<option value="${escapeHtml(player.id)}">${escapeHtml(player.name)}</option>`
                   ).join("")}
                 </select>
               </label>
-              <button class="goal-add-button" type="button" data-action="goal" data-match="${escapeHtml(match.id)}">⚽ Add goal</button>
+              <button class="goal-add-button" type="button" data-action="goal" data-match="${escapeHtml(match.id)}"${disabled}>⚽ Add goal</button>
             </div>
           ` : ""}
-          ${status === "live" ? `<button class="match-control-primary" type="button" data-action="finish" data-match="${escapeHtml(match.id)}">Finish match</button>` : ""}
-          ${isFinished && correctFinished ? `<button class="secondary-button" type="button" data-action="reopen" data-match="${escapeHtml(match.id)}">Reopen match</button>` : ""}
+          ${status === "live" ? `<button class="match-control-primary" type="button" data-action="finish" data-match="${escapeHtml(match.id)}"${disabled}>Finish match</button>` : ""}
+          ${isFinished && correctFinished ? `<button class="secondary-button" type="button" data-action="reopen" data-match="${escapeHtml(match.id)}"${disabled}>Reopen match</button>` : ""}
         </div>` : "";
       return `<article class="match-card ${escapeHtml(status)}">
         <header class="match-card-header">
@@ -731,7 +752,7 @@
     }).join("")}</div>`;
   }
 
-  function getPlayersForMatch(match, teamId) {
+  function getPlayersForMatch(teamId) {
     return players.filter(player => player.teamId === teamId);
   }
 
@@ -856,8 +877,11 @@
           </div>
           <div class="card">
             <h2>Knockout bracket</h2>
-            <p class="muted">Uses the current league standings to seed a bracket.</p>
-            <button id="generateQuarter" type="button" ${calculateStandings().length >= 8 ? "" : "disabled"}>Generate Quarter-finals</button>
+            <p class="muted">Requires at least eight teams and all league fixtures finished.</p>
+            <button id="generateQuarter" type="button"
+              ${calculateStandings().length >= 8 && isLeagueStageComplete() ? "" : "disabled"}>
+              Generate Quarter-finals
+            </button>
           </div>
         </div>`;
       document.getElementById("generateLeague").addEventListener("click", () =>
@@ -999,9 +1023,14 @@
   async function saveScorekeeperGrant(event) {
     event.preventDefault();
     const form = event.currentTarget;
+    const name = document.getElementById("scorekeeperName").value.trim();
     const email = document.getElementById("scorekeeperEmail").value.trim();
     const startsAt = new Date(document.getElementById("scorekeeperStarts").value);
     const expiresAt = new Date(document.getElementById("scorekeeperExpires").value);
+    if (!name) {
+      showAdminMessage("Scorekeeper name is required.");
+      return;
+    }
     if (!email || !Number.isFinite(startsAt.getTime()) || !Number.isFinite(expiresAt.getTime()) || expiresAt <= startsAt) {
       showAdminMessage("Choose a valid email and an expiry time later than the start time.");
       return;
@@ -1009,7 +1038,7 @@
 
     try {
       await tournamentRef().collection("scorekeepers").doc(email).set({
-        name: document.getElementById("scorekeeperName").value.trim(),
+        name,
         email,
         startsAt: firebase.firestore.Timestamp.fromDate(startsAt),
         expiresAt: firebase.firestore.Timestamp.fromDate(expiresAt),
@@ -1039,12 +1068,19 @@
     return db.collection("tournaments").doc(activeTournamentId);
   }
 
+  function updateTournamentUrl(tournamentId) {
+    const url = new URL(location.href);
+    if (tournamentId) url.searchParams.set("tournament", tournamentId);
+    else url.searchParams.delete("tournament");
+    history.replaceState(null, "", url);
+  }
+
   function bindTeamAdmin(content) {
     content.querySelector("#teamForm").addEventListener("submit", async event => {
       event.preventDefault();
       await runAdminAction(async () => {
         const name = document.getElementById("teamName").value.trim();
-        if (!name) return;
+        if (!name) throw new Error("Team name is required.");
         await tournamentRef().collection("teams").add({ name, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
         event.target.reset();
       });
@@ -1066,7 +1102,7 @@
               transaction.get(team)
             ]);
             if (!tournamentSnapshot.exists) throw new Error("The tournament no longer exists.");
-            if (!teamSnapshot.exists) return;
+            if (!teamSnapshot.exists) throw new Error("The team no longer exists.");
             const counts = tournamentSnapshot.data().teamPlayerCounts;
             if (!hasTeamPlayerCounts(counts)) {
               throw new Error("Team player counts are still initializing. Try again shortly.");
@@ -1110,7 +1146,7 @@
         event.preventDefault();
         await runAdminAction(async () => {
           const name = form.querySelector(".new-player-name").value.trim();
-          if (!name) return;
+          if (!name) throw new Error("Player name is required.");
           const tournament = tournamentRef();
           const team = tournament.collection("teams").doc(teamId);
           const player = tournament.collection("players").doc();
@@ -1325,7 +1361,7 @@
                 transaction.get(tournament),
                 transaction.get(player)
               ]);
-              if (!playerSnapshot.exists) return;
+              if (!playerSnapshot.exists) throw new Error("The player no longer exists.");
               if (!tournamentSnapshot.exists) throw new Error("The tournament no longer exists.");
               const tournamentData = tournamentSnapshot.data();
               const counts = tournamentData.teamPlayerCounts;
@@ -1401,7 +1437,10 @@
 
   async function generateQuarterFinals() {
     const standings = calculateStandings();
-    if (standings.length < 8) return;
+    if (standings.length < 8) throw new Error("At least eight teams are required for quarter-finals.");
+    if (!isLeagueStageComplete()) {
+      throw new Error("Finish every league fixture before generating quarter-finals.");
+    }
     if (!confirm("Replace existing knockout fixtures?")) return;
     const existing = matches.filter(match => match.stage === "Knockout");
     const batch = db.batch();
@@ -1427,36 +1466,49 @@
   function bindMatchAdmin(content) {
     content.querySelectorAll("[data-action]").forEach(button => {
       button.addEventListener("click", () => {
+        const action = button.dataset.action;
+        const matchId = button.dataset.match;
         const messages = {
           start: "Match started.",
           goal: "Goal saved and score updated.",
           finish: "Match finished.",
           reopen: "Match reopened.",
         };
-        runAdminAction(
-          () => handleMatchAction(button.dataset.action, button.dataset.match),
-          messages[button.dataset.action] || ""
+        runMatchAdminAction(
+          button,
+          () => handleMatchAction(action, matchId),
+          messages[action] || ""
         );
       });
     });
     content.querySelectorAll(".remove-goal").forEach(button => {
-      button.addEventListener("click", () => runAdminAction(
-        () => removeGoal(button.dataset.match, button.dataset.goal),
-        "Goal removed and score corrected."
-      ));
+      button.addEventListener("click", () => {
+        const matchId = button.dataset.match;
+        const goalId = button.dataset.goal;
+        runMatchAdminAction(
+          button,
+          () => removeGoal(matchId, goalId),
+          "Goal removed and score corrected."
+        );
+      });
     });
     content.querySelectorAll(".save-goal").forEach(button => {
-      button.addEventListener("click", () => runAdminAction(
-        () => editGoal(button.dataset.match, button.dataset.goal, button),
-        "Goal scorer updated."
-      ));
+      button.addEventListener("click", () => {
+        const matchId = button.dataset.match;
+        const goalId = button.dataset.goal;
+        runMatchAdminAction(
+          button,
+          () => editGoal(matchId, goalId, button),
+          "Goal scorer updated."
+        );
+      });
     });
     content.querySelectorAll(".edit-goal-team").forEach(select => {
       select.addEventListener("change", () => {
         const playerSelect = select.closest(".goal-item")?.querySelector(".edit-goal-player");
         const match = matches.find(item => item.id === select.dataset.match);
         if (!playerSelect || !match) return;
-        const eligiblePlayers = getPlayersForMatch(match, select.value);
+        const eligiblePlayers = getPlayersForMatch(select.value);
         playerSelect.innerHTML = eligiblePlayers.map(player =>
           `<option value="${escapeHtml(player.id)}">${escapeHtml(player.name)}</option>`
         ).join("");
@@ -1467,11 +1519,29 @@
         const playerSelect = select.closest(".match-card")?.querySelector(".goal-player");
         const match = matches.find(item => item.id === select.dataset.match);
         if (!playerSelect || !match) return;
-        playerSelect.innerHTML = getPlayersForMatch(match, select.value).map(player =>
+        playerSelect.innerHTML = getPlayersForMatch(select.value).map(player =>
           `<option value="${escapeHtml(player.id)}">${escapeHtml(player.name)}</option>`
         ).join("");
       });
     });
+  }
+
+  async function runMatchAdminAction(button, action, successMessage) {
+    const matchId = button.dataset.match;
+    const card = button.closest(".match-card");
+    if (!matchId || !card) {
+      showAdminMessage("Unable to identify this match action. Refresh and try again.");
+      return;
+    }
+    if (matchActionsInProgress.has(matchId)) return;
+    matchActionsInProgress.add(matchId);
+    card.querySelectorAll("button, select").forEach(control => { control.disabled = true; });
+    try {
+      await runAdminAction(action, successMessage);
+    } finally {
+      matchActionsInProgress.delete(matchId);
+      renderAdmin();
+    }
   }
 
   async function runAdminAction(action, successMessage = "") {
@@ -1497,7 +1567,10 @@
   async function handleMatchAction(action, matchId) {
     const ref = tournamentRef().collection("matches").doc(matchId);
     const match = matches.find(item => item.id === matchId);
-    if (!match) return;
+    if (!match) throw new Error("The selected match no longer exists. Refresh and try again.");
+    if (!["start", "goal", "finish", "reopen"].includes(action)) {
+      throw new Error("Unknown match action. Refresh and try again.");
+    }
 
     if (action === "start") {
       await ref.update({ status: "live" });
@@ -1507,7 +1580,11 @@
       const card = document.querySelector(`.match-card [data-action="goal"][data-match="${matchId}"]`)?.closest(".match-card");
       const teamId = card?.querySelector(".goal-team")?.value;
       const playerId = card?.querySelector(".goal-player")?.value;
-      if (!teamId || !playerId) return;
+      const selectedPlayer = players.find(player => player.id === playerId);
+      if (!teamId || !selectedPlayer || selectedPlayer.teamId !== teamId ||
+          ![match.teamAId, match.teamBId].includes(teamId)) {
+        throw new Error("Select a valid scorer from one of the teams in this match.");
+      }
       const goal = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         teamId,
@@ -1539,6 +1616,9 @@
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) throw new Error("The match no longer exists.");
       const current = snapshot.data();
+      if (!(current.goals || []).some(goal => goal.id === goalId)) {
+        throw new Error("The goal no longer exists.");
+      }
       const goals = (current.goals || []).filter(goal => goal.id !== goalId);
       transaction.update(ref, scoreFields(current, goals));
     });
@@ -1557,6 +1637,9 @@
       const snapshot = await transaction.get(ref);
       if (!snapshot.exists) throw new Error("The match no longer exists.");
       const current = snapshot.data();
+      if (!(current.goals || []).some(goal => goal.id === goalId)) {
+        throw new Error("The goal no longer exists.");
+      }
       const goals = (current.goals || []).map(goal => goal.id === goalId
         ? { ...goal, teamId, playerId, playerName: selectedPlayer.name }
         : goal
@@ -1579,46 +1662,57 @@
     const winnerId = finishedMatch.teamAScore > finishedMatch.teamBScore
       ? finishedMatch.teamAId
       : finishedMatch.teamBId;
-
+    const matchCollection = tournamentRef().collection("matches");
     if (finishedMatch.round === "Quarter-finals") {
-      const currentFinals = matches.filter(match => match.round === "Semi-finals");
-      let target = currentFinals[finishedMatch.bracketIndex < 2 ? 0 : 1];
-      if (!target) {
-        const targetIndex = finishedMatch.bracketIndex < 2 ? 0 : 1;
-        const ref = tournamentRef().collection("matches").doc();
-        await ref.set({
-          stage: "Knockout", round: "Semi-finals", bracketIndex: targetIndex,
-          teamAId: targetIndex === 0 ? winnerId : null,
-          teamBId: targetIndex === 0 ? null : winnerId,
-          teamAScore: 0, teamBScore: 0, status: "scheduled", goals: [],
-          createdAt: firebase.firestore.FieldValue.serverTimestamp()
-        });
-      } else {
-        const field = finishedMatch.bracketIndex % 2 === 0 ? "teamAId" : "teamBId";
-        await tournamentRef().collection("matches").doc(target.id).update({ [field]: winnerId });
+      const quarterFinalIndex = finishedMatch.bracketIndex;
+      if (!Number.isInteger(quarterFinalIndex) || quarterFinalIndex < 0 || quarterFinalIndex > 3) {
+        throw new Error("The quarter-final bracket position is invalid.");
       }
+      const semifinalIndex = Math.floor(quarterFinalIndex / 2);
+      const field = quarterFinalIndex % 2 === 0 ? "teamAId" : "teamBId";
+      await setKnockoutParticipant("Semi-finals", semifinalIndex, field, winnerId, matchCollection);
     } else if (finishedMatch.round === "Semi-finals") {
-      const finals = matches.find(match => match.round === "Final");
-      if (finals) {
-        const field = finishedMatch.bracketIndex === 0 ? "teamAId" : "teamBId";
-        await tournamentRef().collection("matches").doc(finals.id).update({ [field]: winnerId });
-      } else {
-        const ref = tournamentRef().collection("matches").doc();
-        await ref.set({
-          stage: "Knockout", round: "Final", bracketIndex: 0,
-          teamAId: finishedMatch.bracketIndex === 0 ? winnerId : null,
-          teamBId: finishedMatch.bracketIndex === 1 ? winnerId : null,
-          teamAScore: 0, teamBScore: 0, status: "scheduled", goals: [],
-          createdAt: firebase.firestore.FieldValue.serverTimestamp()
-        });
+      const semifinalIndex = finishedMatch.bracketIndex;
+      if (!Number.isInteger(semifinalIndex) || semifinalIndex < 0 || semifinalIndex > 1) {
+        throw new Error("The semi-final bracket position is invalid.");
       }
+      const field = semifinalIndex === 0 ? "teamAId" : "teamBId";
+      await setKnockoutParticipant("Final", 0, field, winnerId, matchCollection);
     }
+  }
+
+  async function setKnockoutParticipant(round, bracketIndex, field, teamId, matchCollection) {
+    const existing = matches.find(match =>
+      match.round === round && match.bracketIndex === bracketIndex
+    );
+    const ref = existing
+      ? matchCollection.doc(existing.id)
+      : matchCollection.doc(`knockout-${slugify(round)}-${bracketIndex}`);
+    await db.runTransaction(async transaction => {
+      const snapshot = await transaction.get(ref);
+      if (snapshot.exists) {
+        transaction.update(ref, { [field]: teamId });
+        return;
+      }
+      transaction.set(ref, {
+        stage: "Knockout",
+        round,
+        bracketIndex,
+        teamAId: field === "teamAId" ? teamId : null,
+        teamBId: field === "teamBId" ? teamId : null,
+        teamAScore: 0,
+        teamBScore: 0,
+        status: "scheduled",
+        goals: [],
+        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+    });
   }
 
   async function saveTournamentName(event) {
     event.preventDefault();
     const name = document.getElementById("settingsName").value.trim();
-    if (!name) return;
+    if (!name) throw new Error("Tournament name is required.");
     const rawLimit = document.getElementById("maxPlayersPerTeam").value.trim();
     const maxPlayersPerTeam = rawLimit === "" ? null : Number(rawLimit);
     if (maxPlayersPerTeam !== null &&
@@ -1749,7 +1843,7 @@
       event.preventDefault();
       await runAdminAction(async () => {
         const name = document.getElementById("newTournamentName").value.trim();
-        if (!name) return;
+        if (!name) throw new Error("Tournament name is required.");
         const collection = db.collection("tournaments");
         const id = `${slugify(name).slice(0, 60)}-${collection.doc().id}`;
         const tournamentDocument = collection.doc(id);
@@ -1765,6 +1859,8 @@
           updatedAt: firebase.firestore.FieldValue.serverTimestamp()
         });
         activeTournamentId = id;
+        missingTournamentId = null;
+        updateTournamentUrl(id);
         document.getElementById("newTournamentPanel").classList.add("hidden");
         event.target.reset();
         listenToTournament(id);
@@ -1772,6 +1868,8 @@
     });
     document.getElementById("tournamentSelect").addEventListener("change", event => {
       activeTournamentId = event.target.value;
+      missingTournamentId = null;
+      updateTournamentUrl(activeTournamentId);
       listenToTournament(activeTournamentId);
     });
   }
